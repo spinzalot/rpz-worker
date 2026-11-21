@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { env } from 'cloudflare:workers';
-import { apiMe, apiProgress, apiBuddies, apiBoot, rpzApi, type RpzEnv } from '../../src/rpz/api';
+import { apiMe, apiProgress, apiBuddies, apiBoot, apiSync, rpzApi, type RpzEnv } from '../../src/rpz/api';
 import { seed, ME } from './fixture';
 
 const e = env as unknown as RpzEnv;
@@ -151,5 +151,40 @@ describe('boot', () => {
   it('a new visitor gets just the profile', async () => {
     const b = await apiBoot(e.RPZ_DB, 'google:999', { sub: '999', email: '', name: '' }, 'CW-PZ');
     expect(Object.keys(b)).toEqual(['me']);
+  });
+});
+
+describe('sync', () => {
+  const HEADER = 'Workout Timestamp,Live/On-Demand,Instructor Name,Length (minutes),Fitness Discipline,Type,Title,Class Timestamp,Total Output';
+  // a2 is the second twin of key 1708088400|30 (a1 already has my one ride); p2 rides inside P29's window.
+  const file = [HEADER,
+    '2026-11-10 06:00 (-06),On Demand,Charlotte Weidenbach,30,Cycling,,30 min Power Zone Ride,2024-02-16 08:00 (-06),300',
+    '2026-11-12 06:00 (-06),On Demand,Denis Morton,60,Cycling,,60 min Power Zone Ride,2025-06-16 13:53 (-05),500',
+    '2026-11-13 06:00 (-06),On Demand,Ben Alldis,30,Cycling,,30 min Pop Ride,2025-01-01 08:00 (-06),200',
+  ].join('\n');
+
+  it('stores new rides, reports newly done classes, and returns the fresh profile in two round trips', async () => {
+    const c = counting(e.RPZ_DB);
+    const r = await apiSync(c.db, ME, user, file);
+    expect(c.trips()).toBe(2);
+    expect(r.report).toMatch(/3 cycling rides in file, 2 matched.*, 2 new\./);
+    expect(r.newly).toEqual(expect.arrayContaining([
+      { id: 'CW-PZ', challenge: "Charlotte's PZ Cleaners", titles: ['30 min Power Zone Ride'] },
+      { id: 'P29', challenge: 'Program 29', titles: ['60 min Power Zone Ride'] },
+    ]));
+    expect(r.me.rider!.lastRideAt).toBe(1794484800);   // Nov 12, the newest ride in the file
+    expect(r.me.rider!.lastSync).not.toBe('2026-11-20T12:00:00.000Z');
+  });
+
+  it('adds nothing when the same file is synced again', async () => {
+    const r = await apiSync(e.RPZ_DB, ME, user, file);
+    expect(r.report).toMatch(/, 0 new\./);
+    expect(r.newly).toEqual([]);
+  });
+
+  it('rejects an empty file before reading anything', async () => {
+    const c = counting(e.RPZ_DB);
+    await expect(apiSync(c.db, ME, user, 'x')).rejects.toThrow(/looks empty/);
+    expect(c.trips()).toBe(0);
   });
 });

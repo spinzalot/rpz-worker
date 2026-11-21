@@ -13,12 +13,13 @@ offered there as merge requests later.
 | `src/rpz/api.ts` | The JSON API (same request/response shape as the Apps Script `doPost`) |
 | `src/rpz/db.ts` | Table types; `batch()` runs all of a request's queries in one D1 round trip |
 | `src/rpz/auth.ts` | Google sign-in token check (Google's public keys, cached) |
+| `src/rpz/match.ts` | Ride matching for sync (line-for-line port of the Apps Script rules) and a CSV parser |
 | `src/rpz/dates.ts` | Count windows and program week dates, in America/Chicago like the Sheet |
 | `migrations/` | D1 schema (one table per Sheet tab) |
 | `test/` | Tests; every request path asserts one round trip; bad input gets 400 with none |
 
-Ported so far: `boot`, `me`, `progress`, `buddies`. Next: `sync`, settings, friends, manual marks,
-challenge view, then Strava.
+Ported so far: `boot`, `me`, `progress`, `buddies`, `sync`. Next: settings, friends, manual marks,
+challenge view, join, then Strava.
 
 ## Rules followed (from sourdoughrides.com's AGENTS.md)
 
@@ -27,6 +28,18 @@ challenge view, then Strava.
 - Rider data lives in its own D1 database (`RPZ_DB`), separate from the core site's.
 - Per-rider responses are `Cache-Control: no-store`; no logging on successful requests.
 - The feature sits behind `RPZ_ENABLED` in `[vars]`.
+
+## Cost notes (miss path; everything here is per-rider and never cached)
+
+- **boot / me / progress / buddies:** one round trip each (boot: two only when the remembered
+  challenge is gone). Progress reads one challenge's classes plus my rides of them; buddies also
+  reads everyone's rides of that challenge's keys (the one read that grows with riders x classes).
+- **sync:** two round trips (read, then one transaction that writes and reads back the profile).
+  The phone trims the CSV to recent rides, so a normal sync parses a few dozen rows. A full-history
+  sync (about 7,900 workouts, 1 MB) took about 240 ms locally: rare, but well over the 3 ms
+  average, so it should stay the exception (it happens when a challenge's library is reloaded).
+- Writes: only new rides (`INSERT ... ON CONFLICT DO NOTHING` on the ride's primary key) and the
+  rider's last-sync time.
 
 ## One-time setup (on your computer)
 

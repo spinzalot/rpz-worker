@@ -8,6 +8,7 @@ import { sql, type Compilable } from 'kysely';
 import { qb, type RiderRow, type ChallengeRow, type ClassRow } from './db';
 import { verifyGoogleIdToken, type GoogleUser } from './auth';
 import { countWindow, inWindow, programWeek1 } from './dates';
+import { matchRides, typeClassifier, type MatchedRide } from './match';
 
 export interface RpzEnv {
   RPZ_DB: D1Database;
@@ -17,7 +18,8 @@ export interface RpzEnv {
 }
 export type Verify = (token: unknown, clientId: string) => Promise<GoogleUser>;
 
-const ACTIONS = new Set(['boot', 'me', 'progress', 'buddies']);   // more are ported in later steps
+const ACTIONS = new Set(['boot', 'me', 'progress', 'buddies', 'sync']);   // more are ported in later steps
+const MAX_CSV = 8 * 1024 * 1024;   // a full Peloton history is about 1 MB
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const USERNAME_RE = /^[A-Za-z0-9_.-]{1,40}$/;
 
@@ -295,6 +297,85 @@ function buildBuddies(rows: unknown[][], riderId: string, selected: string[], in
   };
 }
 
+// ---------- sync ----------
+
+/**
+ * Matches the rider's Peloton CSV (usually trimmed on the phone to recent rides) and stores new rides.
+ * Two round trips: read what matching needs, then one transaction that stores the new rides and
+ * reads back the profile. A ride (rider + start time) is stored once: the primary key enforces it,
+ * so two syncs at the same moment can't double-count and no lock is needed.
+ */
+export async function apiSync(db: D1Database, riderId: string, user: GoogleUser, csvText: string) {
+  if (!csvText || csvText.length < 50) throw new UserError('That file looks empty. Pick your Peloton workouts CSV.');
+  const active = qb.selectFrom('challenges').select('id').where('status', '=', 'Active');
+  const [riders, challenges, classes, rules, before] = (await run(db, [{
+    queries: [
+      riderQuery(riderId),
+      qb.selectFrom('challenges').selectAll().where('status', '=', 'Active').limit(100),
+      // Classes of active challenges: primary-key ranges, a few hundred rows each.
+      qb.selectFrom('classes').selectAll().where('challenge_id', 'in', active).orderBy('seq').limit(20000),
+      qb.selectFrom('type_rules').selectAll().limit(50),
+      qb.selectFrom('completions').select(['class_key', 'ridden_at']).where('rider_id', '=', riderId).limit(50000),
+    ],
+    build: (rows) => rows,
+  }] as const))[0] as [RiderRow[], ChallengeRow[], ClassRow[], { ord: number; title_contains: string; type: string }[],
+    { class_key: string; ridden_at: number }[]];
+  const rider = requireRider(riders[0]);
+
+  let m;
+  try {
+    m = matchRides(csvText, classes.filter((c) => !c.retired), typeClassifier(rules), rider.peloton_username);
+  } catch (e) { throw new UserError(e instanceof Error ? e.message : String(e)); }
+
+  const stored = new Set(before.map((b) => b.ridden_at));
+  const added: MatchedRide[] = [];
+  for (const r of m.rides) if (!stored.has(r.riddenAt)) { stored.add(r.riddenAt); added.push(r); }
+
+  // Writes and the fresh profile in one transaction. D1 allows 100 bound values per statement,
+  // so new rides go in 25 at a time (4 values each).
+  const writes: Compilable<unknown>[] = [];
+  for (let i = 0; i < added.length; i += 25) {
+    writes.push(qb.insertInto('completions')
+      .values(added.slice(i, i + 25).map((r) => ({ rider_id: riderId, ridden_at: r.riddenAt, class_key: r.key, source: 'sync' })))
+      .onConflict((oc) => oc.doNothing()));
+  }
+  writes.push(qb.updateTable('riders').set({ last_sync_on: new Date().toISOString() }).where('rider_id', '=', riderId));
+  const [, me] = await run(db, [{ queries: writes, build: () => null }, meQuery(riderId, user)] as const);
+
+  // What changed, per active challenge, within each count window (retired and program classes included).
+  const beforeRides = before.map((b) => ({ key: b.class_key, riddenAt: b.ridden_at }));
+  const afterRides = beforeRides.concat(added);
+  const tally = (rides: MatchedRide[], win: ReturnType<typeof countWindow>) => {
+    const t = new Map<string, number>();
+    for (const r of rides) if (inWindow(win, r.riddenAt)) t.set(r.key, (t.get(r.key) || 0) + 1);
+    return t;
+  };
+  const newly: { id: string; challenge: string; titles: string[] }[] = [];
+  const lines = [`${rider.peloton_username}: ${m.cycling} cycling rides in file, ${m.matched} matched` +
+    (m.viaUtc ? ` (${m.viaUtc} with an export time off by 30+ min` + (m.guessed ? `, ${m.guessed} of them to classes with no known instructor` : '') + ')' : '') +
+    `, ${added.length} new.`];
+  for (const ch of challenges) {
+    const win = countWindow(ch.count_from, ch.count_to);
+    const was = tally(beforeRides, win), now = tally(afterRides, win);
+    const groups = groupByKey(classes.filter((c) => c.challenge_id === ch.id && c.type !== 'Other'));
+    const titles: string[] = [];
+    let done = 0, total = 0;
+    groups.forEach((members, k) => {
+      const a = Math.min(members.length, was.get(k) || 0), b = Math.min(members.length, now.get(k) || 0);
+      members.slice(a, b).forEach((x) => titles.push(x.title));
+      done += b; total += members.length;
+    });
+    if (titles.length) newly.push({ id: ch.id, challenge: ch.name, titles });
+    lines.push(`  ${ch.id}: ${done} / ${total} done`);
+  }
+  if (m.misses.length) {
+    lines.push('  Possible misses (a challenge has a class with this title and length, but none close enough in time): ' + m.misses.length);
+    m.misses.slice(0, 8).forEach((x) => lines.push('    ' + x));
+    if (m.misses.length > 8) lines.push('    ...');
+  }
+  return { report: lines.join('\n'), newly, me };
+}
+
 // ---------- the calls ----------
 
 export const apiMe = (db: D1Database, riderId: string, user: GoogleUser) =>
@@ -367,6 +448,9 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
     if ((action === 'progress' || action === 'buddies') && !ID_RE.test(challengeId)) {
       return c.json({ ok: false, error: 'Bad challenge.' }, 400);
     }
+    if (action === 'sync' && (typeof req.csvText !== 'string' || req.csvText.length > MAX_CSV)) {
+      return c.json({ ok: false, error: 'That file is too big or not a CSV.' }, 400);
+    }
     const selected = Array.isArray(req.buddies) ? req.buddies.map(String) : (req.buddy ? [String(req.buddy)] : []);
     if (selected.length > 50 || !selected.every((u) => USERNAME_RE.test(u))) {
       return c.json({ ok: false, error: 'Bad rider list.' }, 400);
@@ -383,6 +467,7 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
         case 'me': data = await apiMe(db, riderId, user); break;
         case 'progress': data = await apiProgress(db, riderId, challengeId, !!req.includeRetired, programs); break;
         case 'buddies': data = await apiBuddies(db, riderId, challengeId, selected, programs); break;
+        case 'sync': data = await apiSync(db, riderId, user, req.csvText as string); break;
       }
       return c.json({ ok: true, data, ms: Date.now() - t0, authMs });
     } catch (err) {
