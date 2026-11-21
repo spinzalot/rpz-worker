@@ -3,3 +3,4 @@ node_modules/
 .dev.vars
 *.log
 .local/
+rpz-d1-export.sql
