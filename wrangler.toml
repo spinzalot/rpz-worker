@@ -1,0 +1,23 @@
+# RedditPZ challenge features, developed in their own account and shaped to merge into
+# sourdoughrides.com's Worker later (see README).
+name = "rpz-worker"
+main = "src/index.ts"
+compatibility_date = "2026-08-15"
+
+[assets]
+directory = "public"
+
+[[d1_databases]]
+binding = "RPZ_DB"
+database_name = "rpz"
+database_id = "REPLACE_AFTER_wrangler_d1_create"
+migrations_dir = "migrations"
+
+[vars]
+RPZ_ENABLED = "true"
+GOOGLE_CLIENT_ID = "971118752046-16hom4b3b76gqamdhhi7tjahdjb8ri59.apps.googleusercontent.com"
+# Comma-separated origins allowed to call the API from a browser (the GitHub Pages page, for now).
+ALLOWED_ORIGINS = "https://spinzalot.github.io"
+
+[observability]
+enabled = true
