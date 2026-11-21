@@ -31,6 +31,7 @@ export interface RpzDatabase {
   friends: FriendRow;
   manual: ManualRow;
   admins: { email: string };
+  strava_links: { rider_id: string; athlete_id: number | null; name: string; ftp: number; access: string; refresh: string; expires_at: number };
 }
 
 /** Query builder only: it compiles SQL and never connects anywhere itself. */

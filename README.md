@@ -19,7 +19,10 @@ offered there as merge requests later.
 | `test/` | Tests; every request path asserts one round trip; bad input gets 400 with none |
 
 Ported: `boot`, `me`, `progress`, `buddies`, `sync`, `join`, `settings`, `challengeView`, `toggleManual`,
-`friendSearch`, `friendAdd`, `friendRemove`, `image`. Next: Strava (`stravaConnect`, `stravaDisconnect`, `power`).
+`friendSearch`, `friendAdd`, `friendRemove`, `image`, `stravaConnect`, `stravaDisconnect`, `power`. Every
+Apps Script call is ported. Strava sign-ins live in `strava_links` (migration 0002); set the secret with
+`npx wrangler secret put STRAVA_CLIENT_SECRET`. Before 2027-06-01, switch `/oauth/deauthorize` to
+Strava's replacement.
 
 ## Rules followed (from sourdoughrides.com's AGENTS.md)
 

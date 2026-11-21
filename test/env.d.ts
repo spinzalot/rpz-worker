@@ -5,6 +5,7 @@ declare namespace Cloudflare {
     RPZ_ENABLED: string;
     GOOGLE_CLIENT_ID: string;
     ALLOWED_ORIGINS: string;
+    STRAVA_CLIENT_ID: string;
     TEST_MIGRATIONS: import('cloudflare:test').D1Migration[];
   }
 }

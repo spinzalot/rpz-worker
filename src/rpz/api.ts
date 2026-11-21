@@ -9,8 +9,9 @@ import { qb, type RiderRow, type ChallengeRow, type ClassRow } from './db';
 import { verifyGoogleIdToken, type GoogleUser } from './auth';
 import { countWindow, inWindow, programWeek1 } from './dates';
 import { matchRides, typeClassifier, type MatchedRide } from './match';
+import { stravaLinkQuery, stravaStatus, stravaConnect, stravaDisconnect, stravaPower, type StravaEnv, type StravaLink } from './strava';
 
-export interface RpzEnv {
+export interface RpzEnv extends StravaEnv {
   RPZ_DB: D1Database;
   RPZ_ENABLED: string;
   GOOGLE_CLIENT_ID: string;
@@ -19,13 +20,14 @@ export interface RpzEnv {
 export type Verify = (token: unknown, clientId: string) => Promise<GoogleUser>;
 
 const ACTIONS = new Set(['boot', 'me', 'progress', 'buddies', 'sync', 'join', 'settings', 'challengeView',
-  'toggleManual', 'friendSearch', 'friendAdd', 'friendRemove', 'image']);   // Strava comes later
+  'toggleManual', 'friendSearch', 'friendAdd', 'friendRemove', 'image', 'stravaConnect', 'stravaDisconnect', 'power']);
 const CLASS_RE = /^[0-9a-f]{32}$/;
 const MAX_CSV = 8 * 1024 * 1024;   // a full Peloton history is about 1 MB
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const USERNAME_RE = /^[A-Za-z0-9_.-]{1,40}$/;
 
-export class UserError extends Error {}
+import { UserError } from './errors';
+export { UserError };
 
 /** A call's queries plus how to turn their rows into the response. */
 interface Part<T> { queries: Compilable<unknown>[]; build: (rows: unknown[][]) => T }
@@ -111,15 +113,16 @@ export function meQuery(riderId: string, user: GoogleUser): Part<ReturnType<type
         .select(['c.challenge_id', sql<number>`max(c.week)`.as('weeks')])
         .where('ch.kind', '=', 'Program').where('ch.status', '=', 'Active').groupBy('c.challenge_id'),
       qb.selectFrom('type_rules').select(['type', 'grid_order']).where('grid_order', 'is not', null).orderBy('grid_order').limit(50),
+      stravaLinkQuery(riderId),
     ],
     build: (rows) => buildMe(rows, user),
   };
 }
 
 function buildMe(rows: unknown[][], user: GoogleUser) {
-  const [riders, last, friends, challenges, weeks, rules] = rows as [
+  const [riders, last, friends, challenges, weeks, rules, strava] = rows as [
     RiderRow[], { last: number | null }[],
-    FriendListRow[], ChallengeRow[], { challenge_id: string; weeks: number | null }[], { type: string }[]];
+    FriendListRow[], ChallengeRow[], { challenge_id: string; weeks: number | null }[], { type: string }[], StravaLink[]];
   const r = riders[0];
   checkActive(r);
   const weekOf = new Map(weeks.map((w) => [w.challenge_id, Number(w.weeks) || 0]));
@@ -130,7 +133,7 @@ function buildMe(rows: unknown[][], user: GoogleUser) {
     rider: r ? {
       pelotonUsername: r.peloton_username, discordName: r.discord_name, visibility: visibilityOf(r),
       lastSync: r.last_sync_on || '', lastRideAt: Number(last[0]?.last) || 0,
-      strava: { connected: false },   // Strava moves over in a later step
+      strava: stravaStatus(strava[0]),
     } : null,
     friends: r ? buildFriends(friends) : [],
     challenges: challenges.map((c) => {
@@ -544,6 +547,18 @@ export async function apiImage(classId: string, fetcher: typeof fetch = fetch) {
   return { png: btoa(bin) };
 }
 
+// ---------- Strava helpers ----------
+
+async function riderAndStrava(db: D1Database, riderId: string): Promise<[RiderRow | undefined, StravaLink | undefined]> {
+  const [[r, l]] = await run(db, [{ queries: [riderQuery(riderId), stravaLinkQuery(riderId)],
+    build: (rows) => [(rows[0] as RiderRow[])[0], (rows[1] as StravaLink[])[0]] as [RiderRow | undefined, StravaLink | undefined] }] as const);
+  return [r, l];
+}
+async function requireRiderById(db: D1Database, riderId: string) {
+  const [[r]] = await run(db, [{ queries: [riderQuery(riderId)], build: (rows) => rows[0] as RiderRow[] }] as const);
+  return requireRider(r);
+}
+
 // ---------- the calls ----------
 
 export const apiMe = (db: D1Database, riderId: string, user: GoogleUser) =>
@@ -653,6 +668,26 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
         case 'friendAdd': data = await apiFriendAdd(db, riderId, req.username); break;
         case 'friendRemove': data = await apiFriendRemove(db, riderId, req.username); break;
         case 'image': data = await apiImage(String(req.id)); break;
+        case 'stravaConnect': {
+          if (typeof req.code !== 'string' || !/^[A-Za-z0-9]{10,100}$/.test(req.code)) throw new UserError('Missing Strava code.');
+          await requireRiderById(db, riderId);
+          await stravaConnect(db, c.env, riderId, req.code);
+          data = await apiMe(db, riderId, user);
+          break;
+        }
+        case 'stravaDisconnect': {
+          const [rider, link] = await riderAndStrava(db, riderId);
+          requireRider(rider);
+          await stravaDisconnect(db, link);
+          data = await apiMe(db, riderId, user);
+          break;
+        }
+        case 'power': {
+          const [rider, link] = await riderAndStrava(db, riderId);
+          requireRider(rider);
+          data = await stravaPower(db, c.env, link, Number(req.rodeAt) || 0, Math.min(240, Number(req.lengthMin) || 0));
+          break;
+        }
       }
       return c.json({ ok: true, data, ms: Date.now() - t0, authMs });
     } catch (err) {
