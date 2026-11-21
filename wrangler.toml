@@ -7,7 +7,7 @@ compatibility_date = "2026-08-15"
 [[d1_databases]]
 binding = "RPZ_DB"
 database_name = "rpz"
-database_id = "REPLACE_AFTER_wrangler_d1_create"
+database_id = "da700b4d-52c9-40c4-a214-c11f3d3b4ee0"
 migrations_dir = "migrations"
 
 [vars]

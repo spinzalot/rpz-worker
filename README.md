@@ -55,7 +55,7 @@ Strava's replacement.
 git clone https://github.com/spinzalot/rpz-worker.git && cd rpz-worker
 npm ci
 npx wrangler login                     # opens the browser; sign in to Cloudflare
-npx wrangler d1 create rpz             # prints a database_id: paste it into wrangler.toml
+npx wrangler d1 create rpz             # only for a fresh account: paste its database_id into wrangler.toml
 npm run db:migrate:remote              # creates the tables
 ```
 
