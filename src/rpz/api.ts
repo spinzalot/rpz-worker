@@ -33,6 +33,24 @@ export { UserError };
 interface Part<T> { queries: Compilable<unknown>[]; build: (rows: unknown[][]) => T }
 
 /** Runs any number of parts in one D1 batch. */
+/** What one request cost in D1: round trips, rows read and rows written (D1's billing units). Returned
+ *  with each response so the page's ?debug view shows it; nothing is logged. */
+export interface Meter { trips: number; read: number; written: number }
+function metered(db: D1Database, meter: Meter): D1Database {
+  return new Proxy(db, {
+    get(target, prop) {
+      if (prop === 'batch') return async (stmts: D1PreparedStatement[]) => {
+        const res = await target.batch(stmts);
+        meter.trips++;
+        for (const r of res) { meter.read += r.meta?.rows_read ?? 0; meter.written += r.meta?.rows_written ?? 0; }
+        return res;
+      };
+      const v = Reflect.get(target, prop);
+      return typeof v === 'function' ? v.bind(target) : v;
+    },
+  });
+}
+
 async function run<const P extends readonly Part<unknown>[]>(db: D1Database, parts: P):
     Promise<{ [K in keyof P]: P[K] extends Part<infer T> ? T : never }> {
   const all = parts.flatMap((p) => p.queries);
@@ -622,6 +640,7 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
 
   app.post('/', async (c) => {
     const t0 = Date.now();
+    const meter: Meter = { trips: 0, read: 0, written: 0 };
     let req: Record<string, unknown>;
     try { req = await c.req.json(); } catch { return c.json({ ok: false, error: 'Bad request.' }, 400); }
     const action = String(req.action || '');
@@ -650,7 +669,7 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
       const user = await verify(req.token, c.env.GOOGLE_CLIENT_ID);
       const authMs = Date.now() - t0;
       const riderId = 'google:' + user.sub;
-      const db = c.env.RPZ_DB;
+      const db = metered(c.env.RPZ_DB, meter);
       const programs = req.includePrograms !== false;
       let data: unknown;
       switch (action) {
@@ -689,7 +708,7 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
           break;
         }
       }
-      return c.json({ ok: true, data, ms: Date.now() - t0, authMs });
+      return c.json({ ok: true, data, ms: Date.now() - t0, authMs, d1: meter });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const known = err instanceof UserError || /^(SIGNIN_|Please sign in)/.test(msg);

@@ -132,3 +132,12 @@ it('the rider list still reads back cleanly after all of that', async () => {
   const me = await apiMe(e.RPZ_DB, HIDDEN, { ...user, sub: '333' });
   expect(me.rider!.pelotonUsername).toBe('Hermit');
 });
+
+it('reports what each request cost in D1', async () => {
+  const app = rpzApi(async () => user);
+  const res = await app.request('/', { method: 'POST', body: JSON.stringify({ token: 't', action: 'me' }) }, e);
+  const j = await res.json<{ d1: { trips: number; read: number; written: number } }>();
+  expect(j.d1.trips).toBe(1);
+  expect(j.d1.read).toBeGreaterThan(0);
+  expect(j.d1.written).toBe(0);
+});
