@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { env } from 'cloudflare:workers';
-import { apiMe, apiProgress, rpzApi, type RpzEnv } from '../../src/rpz/api';
+import { apiMe, apiProgress, apiBuddies, apiBoot, rpzApi, type RpzEnv } from '../../src/rpz/api';
 import { seed, ME } from './fixture';
 
 const e = env as unknown as RpzEnv;
@@ -110,5 +110,46 @@ describe('the route', () => {
   it('is off when the flag is off', async () => {
     const res = await app.request('/', { method: 'POST', body: '{}' }, { ...e, RPZ_ENABLED: 'false' });
     expect(res.status).toBe(404);
+  });
+});
+
+describe('buddies', () => {
+  it('lists my remaining classes with riders who share with me and still need them', async () => {
+    const c = counting(e.RPZ_DB);
+    const b = await apiBuddies(c.db, ME, 'CW-PZ', [], true);
+    expect(c.trips()).toBe(1);
+    expect(b.visibility).toBe('Everyone');
+    // Hermit shares with nobody; TheFinder is Friends-only and has me on their list.
+    expect(b.riders).toEqual([{ username: 'TheFinder', discord: '', friend: true }]);
+    // Done: a1 (one ride of the twin key), b1 (manual). Retired r1 and Other x1 never appear.
+    expect(b.classes.map((x) => x.id)).toEqual(['a2']);
+    expect(b.classes[0].buddies).toEqual(['TheFinder']);
+  });
+
+  it('keeps only classes every selected rider still needs', async () => {
+    const b = await apiBuddies(e.RPZ_DB, ME, 'CW-PZ', ['Hermit'], true);
+    expect(b.classes).toEqual([]);   // Hermit isn't visible, so no class has them as a buddy
+  });
+});
+
+describe('boot', () => {
+  it('returns profile, progress and buddies in one round trip for the remembered challenge', async () => {
+    const c = counting(e.RPZ_DB);
+    const b = await apiBoot(c.db, ME, user, 'P29');
+    expect(c.trips()).toBe(1);
+    expect(b).toMatchObject({ challengeId: 'P29' });
+    expect((b as { progress: { total: number } }).progress.total).toBe(2);
+  });
+
+  it('falls back to the first shown challenge when the remembered one is gone', async () => {
+    const c = counting(e.RPZ_DB);
+    const b = await apiBoot(c.db, ME, user, 'GONE');
+    expect(c.trips()).toBe(2);
+    expect(b).toMatchObject({ challengeId: 'CW-PZ' });
+  });
+
+  it('a new visitor gets just the profile', async () => {
+    const b = await apiBoot(e.RPZ_DB, 'google:999', { sub: '999', email: '', name: '' }, 'CW-PZ');
+    expect(Object.keys(b)).toEqual(['me']);
   });
 });

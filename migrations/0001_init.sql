@@ -74,6 +74,8 @@ CREATE TABLE friends (                            -- one-way lists
   added_on  TEXT,
   PRIMARY KEY (rider_id, friend_id)
 );
+-- Buddies: who lists me (decides whether a Friends-only rider shares with me).
+CREATE INDEX friends_by_friend ON friends (friend_id);
 
 CREATE TABLE manual (                             -- gray checks a rider set by hand
   rider_id         TEXT NOT NULL,
@@ -82,6 +84,8 @@ CREATE TABLE manual (                             -- gray checks a rider set by 
   added_on         TEXT,
   PRIMARY KEY (rider_id, challenge_id, peloton_class_id)
 );
+-- Buddies: everyone's manual marks on one challenge.
+CREATE INDEX manual_by_challenge ON manual (challenge_id);
 
 CREATE TABLE admins (
   email TEXT PRIMARY KEY

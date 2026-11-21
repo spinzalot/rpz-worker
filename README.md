@@ -17,7 +17,7 @@ offered there as merge requests later.
 | `migrations/` | D1 schema (one table per Sheet tab) |
 | `test/` | Tests; every request path asserts one round trip; bad input gets 400 with none |
 
-Ported so far: `me`, `progress`. Next: `boot`, `buddies`, `sync`, settings, friends, manual marks,
+Ported so far: `boot`, `me`, `progress`, `buddies`. Next: `sync`, settings, friends, manual marks,
 challenge view, then Strava.
 
 ## Rules followed (from sourdoughrides.com's AGENTS.md)

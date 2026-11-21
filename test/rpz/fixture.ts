@@ -1,6 +1,7 @@
 // A small, realistic data set: one library challenge, one program with twin classes, two riders.
 export const ME = 'google:111';
 export const BUDDY = 'google:222';
+export const HIDDEN = 'google:333';
 
 export async function seed(db: D1Database) {
   const s = (sql: string, ...v: unknown[]) => db.prepare(sql).bind(...v);
@@ -20,7 +21,8 @@ export async function seed(db: D1Database) {
     s(`insert into type_rules (ord,title_contains,type,grid_order) values (1,'Power Zone Endurance','PZE',2),(3,'Power Zone Recovery','PZR',1),(5,'Power Zone','PZ',3),(9,'Warm Up','Other',null)`),
     s(`insert into riders (rider_id,email,peloton_username,discord_name,buddy_opt_in,status,visibility,challenge_view,last_sync_on) values
        (?,'me@example.com','spinzalot','',0,'Active','Everyone','+OLD','2026-11-20T12:00:00.000Z'),
-       (?,'b@example.com','TheFinder','',1,'Active','Friends','',null)`, ME, BUDDY),
+       (?,'b@example.com','TheFinder','',1,'Active','Friends','',null),
+       (?,'h@example.com','Hermit','',0,'Active','Nobody','',null)`, ME, BUDDY, HIDDEN),
     s(`insert into completions (rider_id,ridden_at,class_key,source) values
        (?,1754000000,'1708088400|30|30 min power zone ride','sync'),
        (?,1794000000,'1750000000|45|45 min power zone endurance ride','sync'),
