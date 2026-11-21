@@ -18,7 +18,9 @@ export interface RpzEnv {
 }
 export type Verify = (token: unknown, clientId: string) => Promise<GoogleUser>;
 
-const ACTIONS = new Set(['boot', 'me', 'progress', 'buddies', 'sync']);   // more are ported in later steps
+const ACTIONS = new Set(['boot', 'me', 'progress', 'buddies', 'sync', 'join', 'settings', 'challengeView',
+  'toggleManual', 'friendSearch', 'friendAdd', 'friendRemove', 'image']);   // Strava comes later
+const CLASS_RE = /^[0-9a-f]{32}$/;
 const MAX_CSV = 8 * 1024 * 1024;   // a full Peloton history is about 1 MB
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const USERNAME_RE = /^[A-Za-z0-9_.-]{1,40}$/;
@@ -79,6 +81,21 @@ function groupByKey(classes: ClassRow[]): Map<string, ClassRow[]> {
   return groups;
 }
 
+// ---------- friends list ----------
+
+type FriendListRow = { peloton_username: string; visibility: string; buddy_opt_in: number; lists_me: number };
+/** My friends list, and whether each one shares with me. The inner lookup is one primary-key
+ *  seek per friend, and the outer side is my own short list, not a growing table. */
+const friendsQuery = (riderId: string) =>
+  qb.selectFrom('friends as f').innerJoin('riders as r', 'r.rider_id', 'f.friend_id')
+    .select(['r.peloton_username', 'r.visibility', 'r.buddy_opt_in',
+      sql<number>`exists (select 1 from friends f2 where f2.rider_id = r.rider_id and f2.friend_id = ${riderId})`.as('lists_me')])
+    .where('f.rider_id', '=', riderId).where('r.status', '=', 'Active').limit(500);
+const buildFriends = (rows: FriendListRow[]) => rows.map((f) => ({
+  username: f.peloton_username,
+  sharing: visibilityOf(f) === 'Everyone' || (visibilityOf(f) === 'Friends' && !!f.lists_me),
+})).sort((a, b) => a.username.localeCompare(b.username));
+
 // ---------- me ----------
 
 export function meQuery(riderId: string, user: GoogleUser): Part<ReturnType<typeof buildMe>> {
@@ -87,12 +104,7 @@ export function meQuery(riderId: string, user: GoogleUser): Part<ReturnType<type
       riderQuery(riderId),
       // Primary key prefix (rider_id, ridden_at): reads one index entry.
       qb.selectFrom('completions').select(sql<number>`max(ridden_at)`.as('last')).where('rider_id', '=', riderId),
-      // My friends list, and whether each one shares with me. The inner lookup is one primary-key
-      // seek per friend, and the outer side is my own short list, not a growing table.
-      qb.selectFrom('friends as f').innerJoin('riders as r', 'r.rider_id', 'f.friend_id')
-        .select(['r.peloton_username', 'r.visibility', 'r.buddy_opt_in',
-          sql<number>`exists (select 1 from friends f2 where f2.rider_id = r.rider_id and f2.friend_id = ${riderId})`.as('lists_me')])
-        .where('f.rider_id', '=', riderId).where('r.status', '=', 'Active').limit(500),
+      friendsQuery(riderId),
       qb.selectFrom('challenges').selectAll().where('status', '=', 'Active').limit(100),
       // Weeks per active program (display only): primary-key range per program challenge.
       qb.selectFrom('classes as c').innerJoin('challenges as ch', 'ch.id', 'c.challenge_id')
@@ -107,8 +119,7 @@ export function meQuery(riderId: string, user: GoogleUser): Part<ReturnType<type
 function buildMe(rows: unknown[][], user: GoogleUser) {
   const [riders, last, friends, challenges, weeks, rules] = rows as [
     RiderRow[], { last: number | null }[],
-    { peloton_username: string; visibility: string; buddy_opt_in: number; lists_me: number }[],
-    ChallengeRow[], { challenge_id: string; weeks: number | null }[], { type: string }[]];
+    FriendListRow[], ChallengeRow[], { challenge_id: string; weeks: number | null }[], { type: string }[]];
   const r = riders[0];
   checkActive(r);
   const weekOf = new Map(weeks.map((w) => [w.challenge_id, Number(w.weeks) || 0]));
@@ -121,10 +132,7 @@ function buildMe(rows: unknown[][], user: GoogleUser) {
       lastSync: r.last_sync_on || '', lastRideAt: Number(last[0]?.last) || 0,
       strava: { connected: false },   // Strava moves over in a later step
     } : null,
-    friends: r ? friends.map((f) => ({
-      username: f.peloton_username,
-      sharing: visibilityOf(f) === 'Everyone' || (visibilityOf(f) === 'Friends' && !!f.lists_me),
-    })).sort((a, b) => a.username.localeCompare(b.username)) : [],
+    friends: r ? buildFriends(friends) : [],
     challenges: challenges.map((c) => {
       const byDefault = !!c.hidden_by_default;
       return {
@@ -376,6 +384,166 @@ export async function apiSync(db: D1Database, riderId: string, user: GoogleUser,
   return { report: lines.join('\n'), newly, me };
 }
 
+// ---------- join and settings ----------
+
+/**
+ * First visit: links the Google account to a Peloton username. If the username was synced before
+ * sign-in existed (rider id 'peloton:<username>' with no email), that history is claimed.
+ */
+export async function apiJoin(db: D1Database, riderId: string, user: GoogleUser, pelotonUsername: unknown, discordName: unknown) {
+  const name = String(pelotonUsername ?? '').trim();
+  if (!/^[A-Za-z0-9_.-]{2,40}$/.test(name)) throw new UserError('Enter your Peloton username exactly as it appears on your profile.');
+  const discord = String(discordName ?? '').trim().slice(0, 40);
+  const [found] = await run(db, [{ queries: [
+    qb.selectFrom('riders').selectAll()
+      .where((eb) => eb.or([eb('rider_id', '=', riderId), eb(sql`peloton_username collate nocase`, '=', name)])).limit(5),
+  ], build: (rows) => rows[0] as RiderRow[] }] as const);
+
+  const writes: Compilable<unknown>[] = [];
+  const mine = found.find((r) => r.rider_id === riderId);
+  const sameName = found.find((r) => r.rider_id !== riderId && r.peloton_username.toLowerCase() === name.toLowerCase());
+  if (mine) {
+    writes.push(qb.updateTable('riders').set({ discord_name: discord }).where('rider_id', '=', riderId));
+  } else if (sameName && !(sameName.rider_id.startsWith('peloton:') && !sameName.email)) {
+    throw new UserError('That Peloton username is already linked to another account. Contact the RedditPZ admins.');
+  } else if (sameName) {   // claim pre-sign-in history
+    writes.push(qb.updateTable('riders').set({ rider_id: riderId, email: user.email, discord_name: discord }).where('rider_id', '=', sameName.rider_id));
+    writes.push(qb.updateTable('completions').set({ rider_id: riderId }).where('rider_id', '=', sameName.rider_id));
+  } else {
+    writes.push(qb.insertInto('riders').values({
+      rider_id: riderId, email: user.email, peloton_username: name, discord_name: discord, buddy_opt_in: 0,
+      joined_on: new Date().toISOString(), last_sync_on: null, status: 'Active', visibility: '', challenge_view: '',
+    }).onConflict((oc) => oc.doNothing()));
+  }
+  const [, me] = await run(db, [{ queries: writes, build: () => null }, meQuery(riderId, user)] as const);
+  return me;
+}
+
+/** Discord ID and buddy visibility. One round trip: the update, then the fresh profile. */
+export async function apiSettings(db: D1Database, riderId: string, user: GoogleUser, discordName: unknown, visibility: unknown) {
+  const discord = String(discordName ?? '').trim().replace(/^@+/, '').slice(0, 40);
+  const vis = ['Everyone', 'Friends', 'Nobody'].includes(String(visibility)) ? String(visibility) : 'Nobody';
+  const [, me] = await run(db, [{ queries: [
+    qb.updateTable('riders').set({ discord_name: discord, visibility: vis, buddy_opt_in: vis !== 'Nobody' ? 1 : 0 })
+      .where('rider_id', '=', riderId).where('status', '=', 'Active'),
+  ], build: () => null }, meQuery(riderId, user)] as const);
+  if (!me.rider) throw new UserError('Please join first.');
+  return me;
+}
+
+/** Which challenges I hide from my picker (at least one must stay shown). Stores only my departures from the defaults. */
+export async function apiChallengeView(db: D1Database, riderId: string, user: GoogleUser, hiddenIds: unknown) {
+  const hidden = new Set((Array.isArray(hiddenIds) ? hiddenIds : []).map(String));
+  const [[riders, active]] = await run(db, [{ queries: [
+    riderQuery(riderId), qb.selectFrom('challenges').select(['id', 'hidden_by_default']).where('status', '=', 'Active').limit(100),
+  ], build: (rows) => rows as [RiderRow[], Pick<ChallengeRow, 'id' | 'hidden_by_default'>[]] }] as const);
+  requireRider(riders[0]);
+  if (active.length && active.every((c) => hidden.has(c.id))) throw new UserError('Keep at least one challenge.');
+  const tokens: string[] = [];
+  for (const c of active) {
+    const hide = hidden.has(c.id);
+    if (hide && !c.hidden_by_default) tokens.push('-' + c.id);
+    if (!hide && c.hidden_by_default) tokens.push('+' + c.id);
+  }
+  const [, me] = await run(db, [{ queries: [
+    qb.updateTable('riders').set({ challenge_view: tokens.join(',') }).where('rider_id', '=', riderId),
+  ], build: () => null }, meQuery(riderId, user)] as const);
+  return me;
+}
+
+/** Adds or removes my manual (gray) check on one class of a challenge. */
+export async function apiToggleManual(db: D1Database, riderId: string, challengeId: string, classId: string) {
+  const [[riders, cls, existing]] = await run(db, [{ queries: [
+    riderQuery(riderId),
+    qb.selectFrom('classes').select('peloton_class_id').where('challenge_id', '=', challengeId).where('peloton_class_id', '=', classId),
+    qb.selectFrom('manual').select('peloton_class_id')
+      .where('rider_id', '=', riderId).where('challenge_id', '=', challengeId).where('peloton_class_id', '=', classId),
+  ], build: (rows) => rows as [RiderRow[], unknown[], unknown[]] }] as const);
+  requireRider(riders[0]);
+  if (!cls.length) throw new UserError('Unknown class.');
+  const key = { rider_id: riderId, challenge_id: challengeId, peloton_class_id: classId };
+  if (existing.length) {
+    await run(db, [{ queries: [qb.deleteFrom('manual').where('rider_id', '=', riderId).where('challenge_id', '=', challengeId)
+      .where('peloton_class_id', '=', classId)], build: () => null }] as const);
+    return { manual: false };
+  }
+  await run(db, [{ queries: [qb.insertInto('manual').values({ ...key, added_on: new Date().toISOString() }).onConflict((oc) => oc.doNothing())],
+    build: () => null }] as const);
+  return { manual: true };
+}
+
+// ---------- friends ----------
+
+/** Riders sharing with Everyone whose username contains q, plus an exact username match for anyone. */
+export async function apiFriendSearch(db: D1Database, riderId: string, q: unknown) {
+  const query = String(q ?? '').trim().toLowerCase();
+  if (query.length < 2) return { results: [] as string[] };
+  const like = '%' + query.replace(/[\\%_]/g, (ch) => '\\' + ch) + '%';
+  const [[riders, results]] = await run(db, [{ queries: [
+    riderQuery(riderId),
+    // The riders table is short and grows slowly (hundreds of rows); a LIKE scan of it is the
+    // documented exception, bounded by LIMIT.
+    qb.selectFrom('riders as r').select('r.peloton_username')
+      .where('r.status', '=', 'Active').where('r.rider_id', '!=', riderId)
+      .where((eb) => eb.not(eb.exists(eb.selectFrom('friends as f').select('f.friend_id')
+        .whereRef('f.friend_id', '=', 'r.rider_id').where('f.rider_id', '=', riderId))))
+      .where((eb) => eb.or([
+        eb(sql`lower(r.peloton_username)`, '=', query),
+        eb.and([
+          eb.or([eb('r.visibility', '=', 'Everyone'), eb.and([eb('r.visibility', '=', ''), eb('r.buddy_opt_in', '=', 1)])]),
+          eb(sql`lower(r.peloton_username)`, 'like', sql`${like} escape '\\'`),
+        ]),
+      ]))
+      .orderBy(sql`lower(r.peloton_username)`).limit(20),
+  ], build: (rows) => rows as [RiderRow[], { peloton_username: string }[]] }] as const);
+  requireRider(riders[0]);
+  return { results: results.map((r) => r.peloton_username) };
+}
+
+/** Adds a rider to my friends list by Peloton username. One round trip: look up, insert, read the list. */
+export async function apiFriendAdd(db: D1Database, riderId: string, username: unknown) {
+  const name = String(username ?? '').trim();
+  const [[riders, target, , friends]] = await run(db, [{ queries: [
+    riderQuery(riderId),
+    qb.selectFrom('riders').select('rider_id').where('status', '=', 'Active').where(sql`peloton_username collate nocase`, '=', name).limit(1),
+    qb.insertInto('friends').columns(['rider_id', 'friend_id', 'added_on'])
+      .expression(qb.selectFrom('riders').select([sql<string>`${riderId}`.as('rider_id'), 'rider_id as friend_id', sql<string>`${new Date().toISOString()}`.as('added_on')])
+        .where('status', '=', 'Active').where(sql`peloton_username collate nocase`, '=', name).where('rider_id', '!=', riderId)
+        .where(sql<boolean>`exists (select 1 from riders me where me.rider_id = ${riderId} and me.status = 'Active')`).limit(1))
+      .onConflict((oc) => oc.doNothing()),
+    friendsQuery(riderId),
+  ], build: (rows) => rows as [RiderRow[], { rider_id: string }[], unknown[], FriendListRow[]] }] as const);
+  requireRider(riders[0]);
+  if (!target.length) throw new UserError('No rider with that Peloton username.');
+  if (target[0].rider_id === riderId) throw new UserError("That's you!");
+  return { friends: buildFriends(friends) };
+}
+
+export async function apiFriendRemove(db: D1Database, riderId: string, username: unknown) {
+  const name = String(username ?? '').trim();
+  const [[riders, , friends]] = await run(db, [{ queries: [
+    riderQuery(riderId),
+    qb.deleteFrom('friends').where('rider_id', '=', riderId)
+      .where('friend_id', 'in', qb.selectFrom('riders').select('rider_id').where(sql`peloton_username collate nocase`, '=', name)),
+    friendsQuery(riderId),
+  ], build: (rows) => rows as [RiderRow[], unknown[], FriendListRow[]] }] as const);
+  requireRider(riders[0]);
+  return { friends: buildFriends(friends) };
+}
+
+// ---------- ride graph image ----------
+
+/** Sourdough's ride graph PNG, passed through because his image site doesn't allow other sites to read it. */
+export async function apiImage(classId: string, fetcher: typeof fetch = fetch) {
+  const res = await fetcher(`https://cdn.sourdoughrides.com/${classId}/full_graph_png.png`);
+  if (!res.ok) throw new UserError('No graph for that class.');
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  if (bytes.length > 2_000_000) throw new UserError('That graph is too big.');
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return { png: btoa(bin) };
+}
+
 // ---------- the calls ----------
 
 export const apiMe = (db: D1Database, riderId: string, user: GoogleUser) =>
@@ -445,8 +613,16 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
     // Bad input gets a 400 before any database work.
     if (!ACTIONS.has(action)) return c.json({ ok: false, error: 'Unknown request.' }, 400);
     const challengeId = String(req.challengeId || '');
-    if ((action === 'progress' || action === 'buddies') && !ID_RE.test(challengeId)) {
+    if (['progress', 'buddies', 'toggleManual'].includes(action) && !ID_RE.test(challengeId)) {
       return c.json({ ok: false, error: 'Bad challenge.' }, 400);
+    }
+    if ((action === 'toggleManual' && !CLASS_RE.test(String(req.classId || ''))) ||
+        (action === 'image' && !CLASS_RE.test(String(req.id || '')))) {
+      return c.json({ ok: false, error: 'Unknown class.' }, 400);
+    }
+    if (['friendSearch', 'friendAdd', 'friendRemove'].includes(action) &&
+        String(req.q ?? req.username ?? '').length > 40) {
+      return c.json({ ok: false, error: 'Too long.' }, 400);
     }
     if (action === 'sync' && (typeof req.csvText !== 'string' || req.csvText.length > MAX_CSV)) {
       return c.json({ ok: false, error: 'That file is too big or not a CSV.' }, 400);
@@ -468,6 +644,15 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
         case 'progress': data = await apiProgress(db, riderId, challengeId, !!req.includeRetired, programs); break;
         case 'buddies': data = await apiBuddies(db, riderId, challengeId, selected, programs); break;
         case 'sync': data = await apiSync(db, riderId, user, req.csvText as string); break;
+        case 'join': data = await apiJoin(db, riderId, user, req.pelotonUsername, req.discordName); break;
+        case 'settings': data = await apiSettings(db, riderId, user, req.discordName,
+          req.visibility || (req.buddyOptIn ? 'Everyone' : 'Nobody')); break;
+        case 'challengeView': data = await apiChallengeView(db, riderId, user, req.hidden); break;
+        case 'toggleManual': data = await apiToggleManual(db, riderId, challengeId, String(req.classId)); break;
+        case 'friendSearch': data = await apiFriendSearch(db, riderId, req.q); break;
+        case 'friendAdd': data = await apiFriendAdd(db, riderId, req.username); break;
+        case 'friendRemove': data = await apiFriendRemove(db, riderId, req.username); break;
+        case 'image': data = await apiImage(String(req.id)); break;
       }
       return c.json({ ok: true, data, ms: Date.now() - t0, authMs });
     } catch (err) {

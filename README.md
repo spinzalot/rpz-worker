@@ -18,8 +18,8 @@ offered there as merge requests later.
 | `migrations/` | D1 schema (one table per Sheet tab) |
 | `test/` | Tests; every request path asserts one round trip; bad input gets 400 with none |
 
-Ported so far: `boot`, `me`, `progress`, `buddies`, `sync`. Next: settings, friends, manual marks,
-challenge view, join, then Strava.
+Ported: `boot`, `me`, `progress`, `buddies`, `sync`, `join`, `settings`, `challengeView`, `toggleManual`,
+`friendSearch`, `friendAdd`, `friendRemove`, `image`. Next: Strava (`stravaConnect`, `stravaDisconnect`, `power`).
 
 ## Rules followed (from sourdoughrides.com's AGENTS.md)
 
@@ -38,6 +38,11 @@ challenge view, join, then Strava.
   The phone trims the CSV to recent rides, so a normal sync parses a few dozen rows. A full-history
   sync (about 7,900 workouts, 1 MB) took about 240 ms locally: rare, but well over the 3 ms
   average, so it should stay the exception (it happens when a challenge's library is reloaded).
+- **join, challengeView, toggleManual:** two round trips (check, then write). **settings, friendAdd,
+  friendRemove, friendSearch:** one. Friend search scans the short riders table with `LIKE`
+  (hundreds of rows, bounded by `LIMIT 20`).
+- **image:** no D1 work; one fetch of the PNG from cdn.sourdoughrides.com (goes away if that site
+  allows other sites to read it).
 - Writes: only new rides (`INSERT ... ON CONFLICT DO NOTHING` on the ride's primary key) and the
   rider's last-sync time.
 
