@@ -77,6 +77,13 @@ describe('progress', () => {
     expect(p.done).toBe(1);
     expect(p.classes.find((x) => x.id === 'p1')).toMatchObject({ done: true, week: 1, slot: 'Mon', rodeAt: 1794000000 });
   });
+
+  it('shows a ride from outside the window without counting it', async () => {
+    const p = await apiProgress(e.RPZ_DB, ME, 'P29', false, true);
+    expect(p.classes.find((x) => x.id === 'p2')).toMatchObject({ done: false, rodeAt: 0, otherAt: 1761000000 });
+    expect(p.classes.find((x) => x.id === 'p1')).toMatchObject({ otherAt: 0 });
+    expect(p).toMatchObject({ other: 1, window: { from: '2026-11-02', to: '2026-12-27' } });
+  });
 });
 
 describe('the route', () => {

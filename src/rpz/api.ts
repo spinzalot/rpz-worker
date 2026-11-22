@@ -196,26 +196,31 @@ function buildProgress(rows: unknown[][], includeRetired: boolean, includeProgra
   const typeOrder = ch.types.split(',').map((s) => s.trim()).filter(Boolean);
 
   const win = countWindow(ch.count_from, ch.count_to);
-  const byKey = new Map<string, number[]>();   // class key -> ride times, oldest first
+  const byKey = new Map<string, number[]>();   // class key -> ride times in the window, oldest first
+  const outside = new Map<string, number[]>(); // class key -> ride times outside it, newest first
   for (const r of rides) {
-    if (!inWindow(win, r.ridden_at)) continue;
-    if (!byKey.has(r.class_key)) byKey.set(r.class_key, []);
-    byKey.get(r.class_key)!.push(r.ridden_at);
+    const m = inWindow(win, r.ridden_at) ? byKey : outside;
+    if (!m.has(r.class_key)) m.set(r.class_key, []);
+    m.get(r.class_key)!.push(r.ridden_at);
   }
+  outside.forEach((l) => l.reverse());
   const marked = new Set(manual.map((m) => m.peloton_class_id));
 
   const out: Array<{ id: string; title: string; len: number; type: string; air: number; done: boolean; retired: boolean;
-    program: boolean; instructor: string; manual: boolean; week: number | null; slot: string; rodeAt: number }> = [];
+    program: boolean; instructor: string; manual: boolean; week: number | null; slot: string; rodeAt: number;
+    otherAt: number }> = [];
   groupByKey(classes).forEach((members, k) => {
-    const times = (byKey.get(k) || []).slice();
+    const times = (byKey.get(k) || []).slice(), others = (outside.get(k) || []).slice();
     for (const m of members) {
       const rodeAt = times.length ? times.shift()! : 0;
       const ridden = rodeAt > 0;
       const man = !ridden && marked.has(m.peloton_class_id);
+      // Ridden, but before or after the challenge's window: shown, not counted.
+      const otherAt = !ridden && !man && others.length ? others.shift()! : 0;
       out.push({
         id: m.peloton_class_id, title: m.title, len: m.length_min, type: m.type, air: m.air_epoch,
         done: ridden || man, retired: !!m.retired, program: m.source === 'Program', instructor: m.instructor || '',
-        manual: man, week: m.week ?? null, slot: m.slot || '', rodeAt,
+        manual: man, week: m.week ?? null, slot: m.slot || '', rodeAt, otherAt,
       });
     }
   });
@@ -226,6 +231,8 @@ function buildProgress(rows: unknown[][], includeRetired: boolean, includeProgra
     challenge: { id: ch.id, name: ch.name, kind: ch.kind },
     done: visible.filter((c) => c.done).length,
     total: visible.length,
+    other: visible.filter((c) => c.otherAt > 0).length,
+    window: { from: ch.count_from || '', to: ch.count_to || '' },
     lengths: [...new Set(visible.map((c) => c.len))].sort((a, b) => a - b),
     types: typeOrder.filter((t) => visible.some((c) => c.type === t)),
     classes: visible,
