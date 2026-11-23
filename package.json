@@ -11,17 +11,28 @@
     "db:migrate:remote": "wrangler d1 migrations apply rpz --remote"
   },
   "dependencies": {
-    "hono": "^4.13.19",
-    "kysely": "^0.29.9",
-    "kysely-d1": "^0.4.0"
+    "hono": "4.13.18",
+    "kysely": "0.29.9"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.23.0",
-    "@cloudflare/workers-types": "^5.20261121.1",
-    "typescript": "^7.0.2",
-    "vitest": "~4.1.0",
-    "wrangler": "^4.166.0"
+    "@cloudflare/vitest-pool-workers": "0.23.0",
+    "@cloudflare/workers-types": "5.20260815.1",
+    "@types/node": "22.18.13",
+    "@vitest/runner": "4.1.12",
+    "@vitest/snapshot": "4.1.12",
+    "typescript": "5.9.3",
+    "vite": "7.3.8",
+    "vitest": "4.1.12",
+    "wrangler": "4.124.0"
   },
   "type": "module",
-  "private": true
+  "private": true,
+  "engines": {
+    "node": ">=22.17"
+  },
+  "overrides": {
+    "zod": "4.6.7",
+    "sharp": "0.35.4",
+    "undici": "7.30.1"
+  }
 }
