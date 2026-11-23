@@ -212,7 +212,8 @@ function buildProgress(rows: unknown[][], includeRetired: boolean, includeProgra
   groupByKey(classes).forEach((members, k) => {
     const times = (byKey.get(k) || []).slice(), others = (outside.get(k) || []).slice();
     for (const m of members) {
-      const rodeAt = times.length ? times.shift()! : 0;
+      // Twins share a key: each takes the next ride, oldest first. A class with no twin gets its latest ride.
+      const rodeAt = !times.length ? 0 : members.length === 1 ? times[times.length - 1] : times.shift()!;
       const ridden = rodeAt > 0;
       const man = !ridden && marked.has(m.peloton_class_id);
       // Ridden, but before or after the challenge's window: shown, not counted.
