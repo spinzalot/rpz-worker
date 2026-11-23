@@ -87,3 +87,21 @@ browser calls the Worker cross-origin, allowed by `ALLOWED_ORIGINS` in `wrangler
 Installed from the public npm registry for now. Before offering any of this to
 sourdoughrides.com, switch `.npmrc` to the Greenflagged registry (copy the line from Sean's
 `worker/.npmrc`), run `npm login`, and reinstall, so every package has passed Greenflagged review.
+
+## Auto-deploy (Cloudflare Workers Builds)
+
+Every push to GitHub builds and tests the Worker on Cloudflare; a push to `main` then deploys it.
+Same setup as sourdoughrides.com (its `worker/README.md`), adapted to this repo.
+
+| Setting | Value |
+|---|---|
+| Repository | `spinzalot/rpz-worker`, root directory `/` |
+| Production branch | `main` |
+| Build command (every branch) | `npm config set --location=user "//greenflagged.dev/npm/:_authToken" "$GREENFLAGGED_NPM_TOKEN" && npm ci --silent && npm run check && npm test` |
+| Deploy command (`main`) | `npm run db:migrate:remote && npx wrangler deploy` |
+| Preview builds (other branches) | on |
+| Preview command | `npx wrangler versions upload` (uploads a version, deploys nothing) |
+| Build variables | `GREENFLAGGED_NPM_TOKEN` (encrypted), `NODE_VERSION` = `22.17.0` |
+
+A failing check or test stops the build, so nothing broken deploys. New migrations apply on deploy;
+D1 records which have run, so each runs once.
