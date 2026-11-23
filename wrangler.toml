@@ -16,6 +16,9 @@ GOOGLE_CLIENT_ID = "971118752046-16hom4b3b76gqamdhhi7tjahdjb8ri59.apps.googleuse
 # Comma-separated origins allowed to call the API from a browser (the GitHub Pages page, for now).
 ALLOWED_ORIGINS = "https://spinzalot.github.io"
 STRAVA_CLIENT_ID = "298650"
+DISCORD_CLIENT_ID = "1574563901864157224"
+DISCORD_REDIRECT_URI = "https://spinzalot.github.io/redditpz/"
+# Secrets (Cloudflare dashboard or `npx wrangler secret put`): SESSION_SECRET, DISCORD_CLIENT_SECRET
 # STRAVA_CLIENT_SECRET is a secret: npx wrangler secret put STRAVA_CLIENT_SECRET
 
 [observability]

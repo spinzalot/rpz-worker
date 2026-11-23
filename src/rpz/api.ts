@@ -7,6 +7,7 @@ import { Hono } from 'hono';
 import { sql, type Compilable } from 'kysely';
 import { qb, type RiderRow, type ChallengeRow, type ClassRow } from './db';
 import { verifyGoogleIdToken, type GoogleUser } from './auth';
+import { signSession, verifySession, discordIdentity, PROVIDERS, type Provider, type Who } from './session';
 import { countWindow, inWindow, programWeek1 } from './dates';
 import { matchRides, typeClassifier, type MatchedRide } from './match';
 import { stravaLinkQuery, stravaStatus, stravaConnect, stravaDisconnect, stravaPower, type StravaEnv, type StravaLink } from './strava';
@@ -16,10 +17,16 @@ export interface RpzEnv extends StravaEnv {
   RPZ_ENABLED: string;
   GOOGLE_CLIENT_ID: string;
   ALLOWED_ORIGINS: string;
+  SESSION_SECRET?: string;
+  DISCORD_CLIENT_ID?: string;
+  DISCORD_CLIENT_SECRET?: string;
+  DISCORD_REDIRECT_URI?: string;
 }
+/** Who is asking, as the calls need it: display name, and the sign-in used (for joining). */
+export interface User { name: string; email?: string; provider?: Provider; subject?: string; sub?: string }
 export type Verify = (token: unknown, clientId: string) => Promise<GoogleUser>;
 
-const ACTIONS = new Set(['boot', 'me', 'progress', 'buddies', 'sync', 'join', 'settings', 'challengeView',
+const ACTIONS = new Set(['signin', 'link', 'unlink', 'boot', 'me', 'progress', 'buddies', 'sync', 'join', 'settings', 'challengeView',
   'toggleManual', 'friendSearch', 'friendAdd', 'friendRemove', 'image', 'stravaConnect', 'stravaDisconnect', 'power']);
 const CLASS_RE = /^[0-9a-f]{32}$/;
 const MAX_CSV = 8 * 1024 * 1024;   // a full Peloton history is about 1 MB
@@ -118,7 +125,7 @@ const buildFriends = (rows: FriendListRow[]) => rows.map((f) => ({
 
 // ---------- me ----------
 
-export function meQuery(riderId: string, user: GoogleUser): Part<ReturnType<typeof buildMe>> {
+export function meQuery(riderId: string, user: User): Part<ReturnType<typeof buildMe>> {
   return {
     queries: [
       riderQuery(riderId),
@@ -132,22 +139,27 @@ export function meQuery(riderId: string, user: GoogleUser): Part<ReturnType<type
         .where('ch.kind', '=', 'Program').where('ch.status', '=', 'Active').groupBy('c.challenge_id'),
       qb.selectFrom('type_rules').select(['type', 'grid_order']).where('grid_order', 'is not', null).orderBy('grid_order').limit(50),
       stravaLinkQuery(riderId),
+      qb.selectFrom('identities').select(['provider', 'name']).where('rider_id', '=', riderId).limit(10),
     ],
     build: (rows) => buildMe(rows, user),
   };
 }
 
-function buildMe(rows: unknown[][], user: GoogleUser) {
-  const [riders, last, friends, challenges, weeks, rules, strava] = rows as [
+function buildMe(rows: unknown[][], user: User) {
+  const [riders, last, friends, challenges, weeks, rules, strava, ids] = rows as [
     RiderRow[], { last: number | null }[],
-    FriendListRow[], ChallengeRow[], { challenge_id: string; weeks: number | null }[], { type: string }[], StravaLink[]];
+    FriendListRow[], ChallengeRow[], { challenge_id: string; weeks: number | null }[], { type: string }[], StravaLink[],
+    { provider: string; name: string }[]];
   const r = riders[0];
   checkActive(r);
   const weekOf = new Map(weeks.map((w) => [w.challenge_id, Number(w.weeks) || 0]));
   const view = parseView(r?.challenge_view || '');
   return {
-    email: user.email,
+    email: user.email || '',
     name: user.name,
+    // Sign-in methods on this account, in button order (Discord, Reddit, Google).
+    signins: PROVIDERS.filter((p) => (ids || []).some((i) => i.provider === p))
+      .map((p) => ({ provider: p, name: (ids || []).find((i) => i.provider === p)!.name })),
     rider: r ? {
       pelotonUsername: r.peloton_username, discordName: r.discord_name, visibility: visibilityOf(r),
       lastSync: r.last_sync_on || '', lastRideAt: Number(last[0]?.last) || 0,
@@ -342,7 +354,7 @@ function buildBuddies(rows: unknown[][], riderId: string, selected: string[], in
  * reads back the profile. A ride (rider + start time) is stored once: the primary key enforces it,
  * so two syncs at the same moment can't double-count and no lock is needed.
  */
-export async function apiSync(db: D1Database, riderId: string, user: GoogleUser, csvText: string) {
+export async function apiSync(db: D1Database, riderId: string, user: User, csvText: string) {
   if (!csvText || csvText.length < 50) throw new UserError('That file looks empty. Pick your Peloton workouts CSV.');
   const active = qb.selectFrom('challenges').select('id').where('status', '=', 'Active');
   const [riders, challenges, classes, rules, before] = (await run(db, [{
@@ -419,14 +431,18 @@ export async function apiSync(db: D1Database, riderId: string, user: GoogleUser,
  * First visit: links the Google account to a Peloton username. If the username was synced before
  * sign-in existed (rider id 'peloton:<username>' with no email), that history is claimed.
  */
-export async function apiJoin(db: D1Database, riderId: string, user: GoogleUser, pelotonUsername: unknown, discordName: unknown) {
+export async function apiJoin(db: D1Database, riderId: string, user: User, pelotonUsername: unknown, discordName: unknown) {
   const name = String(pelotonUsername ?? '').trim();
   if (!/^[A-Za-z0-9_.-]{2,40}$/.test(name)) throw new UserError('Enter your Peloton username exactly as it appears on your profile.');
-  const discord = String(discordName ?? '').trim().slice(0, 40);
-  const [found] = await run(db, [{ queries: [
+  // Signed in with Discord: its account id fills in the Discord field for buddy posts, unless given.
+  const discord = (String(discordName ?? '').trim() || (user.provider === 'discord' ? user.subject || '' : '')).slice(0, 40);
+  const [[found, takenBy]] = await run(db, [{ queries: [
     qb.selectFrom('riders').selectAll()
       .where((eb) => eb.or([eb('rider_id', '=', riderId), eb(sql`peloton_username collate nocase`, '=', name)])).limit(5),
-  ], build: (rows) => rows[0] as RiderRow[] }] as const);
+    // How the account with that username signs in, to point someone back to it.
+    qb.selectFrom('identities as i').innerJoin('riders as r', 'r.rider_id', 'i.rider_id').select('i.provider')
+      .where(sql`r.peloton_username collate nocase`, '=', name).limit(5),
+  ], build: (rows) => rows as [RiderRow[], { provider: string }[]] }] as const);
 
   const writes: Compilable<unknown>[] = [];
   const mine = found.find((r) => r.rider_id === riderId);
@@ -434,22 +450,27 @@ export async function apiJoin(db: D1Database, riderId: string, user: GoogleUser,
   if (mine) {
     writes.push(qb.updateTable('riders').set({ discord_name: discord }).where('rider_id', '=', riderId));
   } else if (sameName && !(sameName.rider_id.startsWith('peloton:') && !sameName.email)) {
-    throw new UserError('That Peloton username is already linked to another account. Contact the RedditPZ admins.');
+    const ways = PROVIDERS.filter((p) => takenBy.some((t) => t.provider === p)).map(providerName);
+    throw new UserError(ways.length
+      ? `${sameName.peloton_username} is already registered. Sign in with ${ways.join(' or ')} to use that account; you can add ` +
+        `${providerName(user.provider || 'google')} sign-in from the Sync tab afterwards.`
+      : 'That Peloton username is already linked to another account. Contact the RedditPZ admins.');
   } else if (sameName) {   // claim pre-sign-in history
-    writes.push(qb.updateTable('riders').set({ rider_id: riderId, email: user.email, discord_name: discord }).where('rider_id', '=', sameName.rider_id));
+    writes.push(qb.updateTable('riders').set({ rider_id: riderId, email: '', discord_name: discord }).where('rider_id', '=', sameName.rider_id));
     writes.push(qb.updateTable('completions').set({ rider_id: riderId }).where('rider_id', '=', sameName.rider_id));
   } else {
     writes.push(qb.insertInto('riders').values({
-      rider_id: riderId, email: user.email, peloton_username: name, discord_name: discord, buddy_opt_in: 0,
+      rider_id: riderId, email: '', peloton_username: name, discord_name: discord, buddy_opt_in: 0,
       joined_on: new Date().toISOString(), last_sync_on: null, status: 'Active', visibility: '', challenge_view: '',
     }).onConflict((oc) => oc.doNothing()));
   }
+  if (user.provider && user.subject) writes.push(identityInsert(user.provider, user.subject, riderId, user.name));
   const [, me] = await run(db, [{ queries: writes, build: () => null }, meQuery(riderId, user)] as const);
   return me;
 }
 
 /** Discord ID and buddy visibility. One round trip: the update, then the fresh profile. */
-export async function apiSettings(db: D1Database, riderId: string, user: GoogleUser, discordName: unknown, visibility: unknown) {
+export async function apiSettings(db: D1Database, riderId: string, user: User, discordName: unknown, visibility: unknown) {
   const discord = String(discordName ?? '').trim().replace(/^@+/, '').slice(0, 40);
   const vis = ['Everyone', 'Friends', 'Nobody'].includes(String(visibility)) ? String(visibility) : 'Nobody';
   const [, me] = await run(db, [{ queries: [
@@ -461,7 +482,7 @@ export async function apiSettings(db: D1Database, riderId: string, user: GoogleU
 }
 
 /** Which challenges I hide from my picker (at least one must stay shown). Stores only my departures from the defaults. */
-export async function apiChallengeView(db: D1Database, riderId: string, user: GoogleUser, hiddenIds: unknown) {
+export async function apiChallengeView(db: D1Database, riderId: string, user: User, hiddenIds: unknown) {
   const hidden = new Set((Array.isArray(hiddenIds) ? hiddenIds : []).map(String));
   const [[riders, active]] = await run(db, [{ queries: [
     riderQuery(riderId), qb.selectFrom('challenges').select(['id', 'hidden_by_default']).where('status', '=', 'Active').limit(100),
@@ -585,9 +606,73 @@ async function requireRiderById(db: D1Database, riderId: string) {
   return requireRider(r);
 }
 
+// ---------- sign-in methods ----------
+
+export const providerName = (p: string) => ({ discord: 'Discord', reddit: 'Reddit', google: 'Google' } as Record<string, string>)[p] || p;
+const identityInsert = (provider: string, subject: string, riderId: string, name: string) =>
+  qb.insertInto('identities').values({ provider, subject, rider_id: riderId, name: name.slice(0, 60), added_on: new Date().toISOString() })
+    .onConflict((oc) => oc.doNothing());
+const identityQuery = (provider: string, subject: string) =>
+  qb.selectFrom('identities').select('rider_id').where('provider', '=', provider).where('subject', '=', subject);
+
+/** Proves a sign-in with a provider: Google's ID token, or Discord's one-time code. */
+async function proveIdentity(env: RpzEnv, req: Record<string, unknown>, verify: Verify, fetcher: typeof fetch) {
+  const provider = String(req.provider || '');
+  if (provider === 'google') {
+    const u = await verify(req.idToken, env.GOOGLE_CLIENT_ID);
+    return { provider: 'google' as Provider, subject: u.sub, name: u.name || '' };
+  }
+  if (provider === 'discord') {
+    const d = await discordIdentity(String(req.code), env, fetcher);
+    return { provider: 'discord' as Provider, subject: d.subject, name: d.name };
+  }
+  throw new UserError('That sign-in method is not available yet.');
+}
+
+/** Sign in: the account this identity belongs to (or a new one, by its own id), plus a session. */
+export async function apiSignin(db: D1Database, env: RpzEnv, req: Record<string, unknown>, verify: Verify, fetcher: typeof fetch) {
+  const id = await proveIdentity(env, req, verify, fetcher);
+  const [[known]] = await run(db, [{ queries: [identityQuery(id.provider, id.subject)],
+    build: (rows) => rows[0] as { rider_id: string }[] }] as const);
+  const who: Who = { ...id, riderId: known?.rider_id || `${id.provider}:${id.subject}` };
+  return { session: await signSession(who, env.SESSION_SECRET), who };
+}
+
+/** Adds another sign-in method to my account; refuses one that already belongs to someone else. */
+export async function apiLink(db: D1Database, env: RpzEnv, who: Who, req: Record<string, unknown>, verify: Verify, fetcher: typeof fetch) {
+  const id = await proveIdentity(env, req, verify, fetcher);
+  const [[riders, owner]] = await run(db, [{ queries: [
+    riderQuery(who.riderId), identityQuery(id.provider, id.subject),
+    qb.selectFrom('identities as i').innerJoin('riders as r', 'r.rider_id', 'i.rider_id').select('r.peloton_username')
+      .where('i.provider', '=', id.provider).where('i.subject', '=', id.subject),
+  ], build: (rows) => [rows[0], rows[2]] as [RiderRow[], { peloton_username: string }[]] }] as const);
+  requireRider(riders[0]);
+  if (owner[0] && owner[0].peloton_username.toLowerCase() !== riders[0].peloton_username.toLowerCase()) {
+    throw new UserError(`That ${providerName(id.provider)} account already signs in to another RedditPZ account (${owner[0].peloton_username}).`);
+  }
+  const [, me] = await run(db, [{ queries: [identityInsert(id.provider, id.subject, who.riderId, id.name),
+    // Discord linked and no Discord name yet: use the account id for buddy posts.
+    ...(id.provider === 'discord' ? [qb.updateTable('riders').set({ discord_name: id.subject })
+      .where('rider_id', '=', who.riderId).where('discord_name', '=', '')] : [])],
+    build: () => null }, meQuery(who.riderId, who)] as const);
+  return me;
+}
+
+/** Removes a sign-in method, keeping at least one. */
+export async function apiUnlink(db: D1Database, who: Who, provider: unknown) {
+  const p = String(provider || '');
+  const [ids] = await run(db, [{ queries: [qb.selectFrom('identities').select(['provider', 'subject']).where('rider_id', '=', who.riderId).limit(10)],
+    build: (rows) => rows[0] as { provider: string; subject: string }[] }] as const);
+  if (!ids.some((i) => i.provider === p)) throw new UserError('That sign-in method is not on your account.');
+  if (ids.length < 2) throw new UserError('Keep at least one way to sign in.');
+  const [, me] = await run(db, [{ queries: [qb.deleteFrom('identities').where('rider_id', '=', who.riderId).where('provider', '=', p)],
+    build: () => null }, meQuery(who.riderId, who)] as const);
+  return me;
+}
+
 // ---------- the calls ----------
 
-export const apiMe = (db: D1Database, riderId: string, user: GoogleUser) =>
+export const apiMe = (db: D1Database, riderId: string, user: User) =>
   run(db, [meQuery(riderId, user)] as const).then(([me]) => me);
 export const apiProgress = (db: D1Database, riderId: string, challengeId: string, includeRetired: boolean, includePrograms: boolean) =>
   run(db, [progressQuery(riderId, challengeId, includeRetired, includePrograms)] as const).then(([p]) => p);
@@ -599,7 +684,7 @@ export const apiBuddies = (db: D1Database, riderId: string, challengeId: string,
  * round trip when the page's remembered challenge is still shown (the usual case); otherwise a
  * second trip for the first shown challenge.
  */
-export async function apiBoot(db: D1Database, riderId: string, user: GoogleUser, wanted: string | null) {
+export async function apiBoot(db: D1Database, riderId: string, user: User, wanted: string | null) {
   const guess = wanted && ID_RE.test(wanted) ? wanted : null;
   if (guess) {
     const [me, progress, buddies] = await run(db, [meQuery(riderId, user),
@@ -628,7 +713,7 @@ function softly<T>(p: Part<T>): Part<T | null> {
 
 // ---------- the route ----------
 
-export function rpzApi(verify: Verify = verifyGoogleIdToken) {
+export function rpzApi(verify: Verify = verifyGoogleIdToken, fetcher: typeof fetch = fetch) {
   const app = new Hono<{ Bindings: RpzEnv }>();
 
   app.use('*', async (c, next) => {
@@ -673,15 +758,37 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken) {
     if (selected.length > 50 || !selected.every((u) => USERNAME_RE.test(u))) {
       return c.json({ ok: false, error: 'Bad rider list.' }, 400);
     }
+    if (['signin', 'link'].includes(action) && !(
+        (req.provider === 'google' && typeof req.idToken === 'string' && req.idToken.length < 4096) ||
+        (req.provider === 'discord' && /^[A-Za-z0-9]{10,100}$/.test(String(req.code || ''))))) {
+      return c.json({ ok: false, error: 'Bad sign-in.' }, 400);
+    }
     try {
-      const user = await verify(req.token, c.env.GOOGLE_CLIENT_ID);
-      const authMs = Date.now() - t0;
-      const riderId = 'google:' + user.sub;
       const db = metered(c.env.RPZ_DB, meter);
+      if (action === 'signin') {
+        const { session, who } = await apiSignin(db, c.env, req, verify, fetcher);
+        const boot = await apiBoot(db, who.riderId, who, challengeId || null);
+        return c.json({ ok: true, data: { session, ...boot }, ms: Date.now() - t0, d1: meter });
+      }
+      // A RedditPZ session ("rpz1."), or (older pages) a Google ID token.
+      const token = String(req.token || '');
+      let user: Who;
+      if (token.startsWith('rpz1.')) user = await verifySession(token, c.env.SESSION_SECRET);
+      else {
+        const g = await verify(req.token, c.env.GOOGLE_CLIENT_ID);
+        user = { provider: 'google', subject: g.sub, name: g.name, riderId: 'google:' + g.sub };
+      }
+      const authMs = Date.now() - t0;
+      const riderId = user.riderId;
       const programs = req.includePrograms !== false;
       let data: unknown;
       switch (action) {
-        case 'boot': data = await apiBoot(db, riderId, user, challengeId || null); break;
+        case 'boot': data = await apiBoot(db, riderId, user, challengeId || null);
+          // Each visit renews the session, so riders who keep using the app stay signed in.
+          if (token.startsWith('rpz1.')) data = { session: await signSession(user, c.env.SESSION_SECRET), ...(data as object) };
+          break;
+        case 'link': data = await apiLink(db, c.env, user, req, verify, fetcher); break;
+        case 'unlink': data = await apiUnlink(db, user, req.provider); break;
         case 'me': data = await apiMe(db, riderId, user); break;
         case 'progress': data = await apiProgress(db, riderId, challengeId, !!req.includeRetired, programs); break;
         case 'buddies': data = await apiBuddies(db, riderId, challengeId, selected, programs); break;
