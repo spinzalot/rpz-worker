@@ -57,7 +57,7 @@ async function stravaGet<T>(db: D1Database, env: StravaEnv, link: StravaLink, pa
     await db.batch([db.prepare(c.sql).bind(...(c.parameters as unknown[]))]);
   }
   const res = await fetcher('https://www.strava.com/api/v3' + path, { headers: { Authorization: 'Bearer ' + link.access } });
-  if (res.status === 401) throw new UserError('Strava access was removed. Connect Strava again (Sync tab).');
+  if (res.status === 401) throw new UserError('Strava access was removed. Connect Strava again in Settings ⚙.');
   if (res.status === 429) throw new UserError('Strava is busy (too many requests). Try again in 15 minutes.');
   if (!res.ok) throw new UserError('Strava error ' + res.status + '.');
   return res.json<T>();
@@ -69,7 +69,7 @@ async function stravaGet<T>(db: D1Database, env: StravaEnv, link: StravaLink, pa
  */
 export async function stravaPower(db: D1Database, env: StravaEnv, link: StravaLink | undefined, rodeAt: number, lengthMin: number,
                                   fetcher: typeof fetch = fetch) {
-  if (!link) throw new UserError('Connect Strava first (Sync tab).');
+  if (!link) throw new UserError('Connect Strava first in Settings ⚙.');
   if (!rodeAt) throw new UserError('No ride time for this class.');
   type Activity = { id: number; name: string; start_date: string; average_watts?: number; average_cadence?: number;
     has_heartrate?: boolean; average_heartrate?: number };

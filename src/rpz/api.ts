@@ -454,7 +454,7 @@ export async function apiJoin(db: D1Database, riderId: string, user: User, pelot
     const ways = PROVIDERS.filter((p) => takenBy.some((t) => t.provider === p)).map(providerName);
     throw new UserError(ways.length
       ? `${sameName.peloton_username} is already registered. Sign in with ${ways.join(' or ')} to use that account; you can add ` +
-        `${providerName(user.provider || 'google')} sign-in from the Sync tab afterwards.`
+        `${providerName(user.provider || 'google')} sign-in from Settings ⚙ afterwards.`
       : 'That Peloton username is already linked to another account. Contact the RedditPZ admins.');
   } else if (sameName) {   // claim pre-sign-in history
     writes.push(qb.updateTable('riders').set({ rider_id: riderId, email: '', discord_name: discord }).where('rider_id', '=', sameName.rider_id));
