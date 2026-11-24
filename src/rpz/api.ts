@@ -228,8 +228,9 @@ function buildProgress(rows: unknown[][], includeRetired: boolean, includeProgra
       const rodeAt = !times.length ? 0 : members.length === 1 ? times[times.length - 1] : times.shift()!;
       const ridden = rodeAt > 0;
       const man = !ridden && marked.has(m.peloton_class_id);
-      // Ridden, but before or after the challenge's window: shown, not counted.
-      const otherAt = !ridden && !man && others.length ? others.shift()! : 0;
+      // Ridden, but before or after the challenge's window: shown, not counted. Sent even when the class is
+      // checked by hand, so unchecking it brings the ↺ back without a reload.
+      const otherAt = !ridden && others.length ? others.shift()! : 0;
       out.push({
         id: m.peloton_class_id, title: m.title, len: m.length_min, type: m.type, air: m.air_epoch,
         done: ridden || man, retired: !!m.retired, program: m.source === 'Program', instructor: m.instructor || '',
@@ -244,7 +245,7 @@ function buildProgress(rows: unknown[][], includeRetired: boolean, includeProgra
     challenge: { id: ch.id, name: ch.name, kind: ch.kind },
     done: visible.filter((c) => c.done).length,
     total: visible.length,
-    other: visible.filter((c) => c.otherAt > 0).length,
+    other: visible.filter((c) => !c.done && c.otherAt > 0).length,
     window: { from: ch.count_from || '', to: ch.count_to || '' },
     lengths: [...new Set(visible.map((c) => c.len))].sort((a, b) => a - b),
     types: typeOrder.filter((t) => visible.some((c) => c.type === t)),
