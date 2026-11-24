@@ -32,6 +32,7 @@ export interface RpzDatabase {
   manual: ManualRow;
   admins: { email: string };
   identities: { provider: string; subject: string; rider_id: string; name: string; added_on: string };
+  group_rsvps: { event_id: string; rider_id: string; status: string; updated_on: string };
   strava_links: { rider_id: string; athlete_id: number | null; name: string; ftp: number; access: string; refresh: string; expires_at: number };
 }
 

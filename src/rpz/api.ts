@@ -8,7 +8,7 @@ import { sql, type Compilable } from 'kysely';
 import { qb, type RiderRow, type ChallengeRow, type ClassRow } from './db';
 import { verifyGoogleIdToken, type GoogleUser } from './auth';
 import { signSession, verifySession, discordIdentity, PROVIDERS, type Provider, type Who } from './session';
-import { countWindow, inWindow, programWeek1 } from './dates';
+import { countWindow, inWindow, programWeek1, dayStart, addDays, tzOffset, RPZ_TZ } from './dates';
 import { matchRides, typeClassifier, type MatchedRide } from './match';
 import { stravaLinkQuery, stravaStatus, stravaConnect, stravaDisconnect, stravaPower, type StravaEnv, type StravaLink } from './strava';
 
@@ -27,7 +27,8 @@ export interface User { name: string; email?: string; provider?: Provider; subje
 export type Verify = (token: unknown, clientId: string) => Promise<GoogleUser>;
 
 const ACTIONS = new Set(['signin', 'link', 'unlink', 'boot', 'me', 'progress', 'buddies', 'sync', 'join', 'settings', 'challengeView',
-  'toggleManual', 'friendSearch', 'friendAdd', 'friendRemove', 'image', 'stravaConnect', 'stravaDisconnect', 'power']);
+  'toggleManual', 'friendSearch', 'friendAdd', 'friendRemove', 'image', 'stravaConnect', 'stravaDisconnect', 'power',
+  'groupRide', 'groupRsvp']);
 const CLASS_RE = /^[0-9a-f]{32}$/;
 const MAX_CSV = 8 * 1024 * 1024;   // a full Peloton history is about 1 MB
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -523,6 +524,99 @@ export async function apiToggleManual(db: D1Database, riderId: string, challenge
   return { manual: true };
 }
 
+// ---------- group rides ----------
+// A weekly group ride on the current program's class for that day: the Saturday ride starts at 9:59 AM
+// Central. Add an entry here for another (an early-bird ride: same day, an earlier time).
+export const GROUP_RIDES: Record<string, { label: string; weekday: number; slot: string; hour: number; minute: number }> = {
+  sat: { label: 'Saturday ride', weekday: 6, slot: 'Sat', hour: 9, minute: 59 },
+};
+const RIDE_OPEN_AFTER_START = 3 * 3600;   // the card stays on this ride until 3 hours after the start
+
+/** Which ride is next (or under way) at `now`: its local date, start and id. */
+export function nextGroupRide(key: string, now: number) {
+  const def = GROUP_RIDES[key];
+  if (!def) throw new UserError('Unknown group ride.');
+  const today = new Date((now + tzOffset(now, RPZ_TZ)) * 1000).toISOString().slice(0, 10);
+  const dow = new Date(today + 'T00:00:00Z').getUTCDay();
+  let ymd = addDays(today, (def.weekday - dow + 7) % 7);
+  const startOf = (d: string) => (dayStart(d) as number) + def.hour * 3600 + def.minute * 60;
+  if (now >= startOf(ymd) + RIDE_OPEN_AFTER_START) ymd = addDays(ymd, 7);
+  return { key, id: key + '-' + ymd, date: ymd, startsAt: startOf(ymd), label: def.label, slot: def.slot };
+}
+
+interface RsvpRow { rider_id: string; status: string; peloton_username: string }
+function groupRideParts(riderId: string, ride: ReturnType<typeof nextGroupRide>) {
+  return {
+    queries: [
+      // Programs whose count window covers the ride's day, with their class for that slot.
+      qb.selectFrom('classes as c').innerJoin('challenges as ch', 'ch.id', 'c.challenge_id')
+        .select(['ch.id as challenge_id', 'ch.name', 'ch.count_to', 'c.peloton_class_id', 'c.class_key', 'c.title', 'c.instructor',
+                 'c.length_min', 'c.type', 'c.week'])
+        .where('ch.kind', '=', 'Program').where('ch.status', '=', 'Active')
+        .where('ch.count_from', '<=', ride.date).where('ch.count_to', '>=', ride.date).where('c.slot', '=', ride.slot),
+      qb.selectFrom('classes as c').innerJoin('challenges as ch', 'ch.id', 'c.challenge_id')
+        .select(['c.challenge_id', sql<number>`max(c.week)`.as('weeks')])
+        .where('ch.kind', '=', 'Program').where('ch.status', '=', 'Active')
+        .where('ch.count_from', '<=', ride.date).where('ch.count_to', '>=', ride.date).groupBy('c.challenge_id'),
+      qb.selectFrom('group_rsvps as g').innerJoin('riders as r', 'r.rider_id', 'g.rider_id')
+        .select(['g.rider_id', 'g.status', 'r.peloton_username']).where('g.event_id', '=', ride.id).orderBy('g.updated_on'),
+      // Only my rides of the candidate classes (a handful of rows, not my whole history).
+      qb.selectFrom('completions').select('class_key').where('rider_id', '=', riderId)
+        .where('class_key', 'in', qb.selectFrom('classes as c').innerJoin('challenges as ch', 'ch.id', 'c.challenge_id').select('c.class_key')
+          .where('ch.kind', '=', 'Program').where('ch.count_from', '<=', ride.date).where('ch.count_to', '>=', ride.date)
+          .where('c.slot', '=', ride.slot)),
+    ],
+    build: (rows: unknown[][]) => {
+      const [cls, weeks, rsvps, mine] = rows as [
+        { challenge_id: string; name: string; count_to: string; peloton_class_id: string; class_key: string; title: string;
+          instructor: string; length_min: number; type: string; week: number }[],
+        { challenge_id: string; weeks: number }[], RsvpRow[], { class_key: string }[]];
+      // The program's week for the ride's day; the newest program wins if two overlap.
+      let pick: (typeof cls)[number] | null = null, pickWeek1 = '';
+      for (const c of cls) {
+        const week1 = programWeek1(c.count_to, Number(weeks.find((w) => w.challenge_id === c.challenge_id)?.weeks) || 0);
+        if (!week1) continue;
+        const week = Math.floor(((dayStart(ride.date) as number) - (dayStart(week1) as number)) / (7 * 86400) + 0.01) + 1;
+        if (c.week === week && week1 > pickWeek1) { pick = c; pickWeek1 = week1; }
+      }
+      const done = !!pick && mine.some((m) => m.class_key === pick!.class_key);
+      return {
+        ride: { id: ride.id, key: ride.key, label: ride.label, date: ride.date, startsAt: ride.startsAt },
+        program: pick ? { id: pick.challenge_id, name: pick.name, week: pick.week } : null,
+        class: pick ? { id: pick.peloton_class_id, title: pick.title, instructor: pick.instructor, len: pick.length_min,
+                        type: pick.type, done } : null,
+        rsvps: rsvps.filter((r) => r.status !== 'out').map((r) => ({ name: r.peloton_username, status: r.status })),
+        out: rsvps.filter((r) => r.status === 'out').length,
+        mine: rsvps.find((r) => r.rider_id === riderId)?.status || '',
+        now: Date.now(),
+      };
+    },
+  };
+}
+export async function apiGroupRide(db: D1Database, riderId: string, key: string, now = Math.floor(Date.now() / 1000)) {
+  const ride = nextGroupRide(key, now);
+  const [[riders], data] = await run(db, [
+    { queries: [riderQuery(riderId)], build: (rows) => rows as [RiderRow[]] },
+    groupRideParts(riderId, ride),
+  ] as const);
+  requireRider(riders[0]);
+  return data;
+}
+/** In / maybe / out for the current ride only; '' takes the answer back. */
+export async function apiGroupRsvp(db: D1Database, riderId: string, key: string, eventId: string, status: string,
+                                   now = Math.floor(Date.now() / 1000)) {
+  const ride = nextGroupRide(key, now);
+  if (eventId !== ride.id) throw new UserError('That ride is over. Refresh for the next one.');
+  if (!['in', 'maybe', 'out', ''].includes(status)) throw new UserError('Pick In, Maybe or Out.');
+  await requireRiderById(db, riderId);
+  const write = status
+    ? qb.insertInto('group_rsvps').values({ event_id: ride.id, rider_id: riderId, status, updated_on: new Date(now * 1000).toISOString() })
+        .onConflict((oc) => oc.columns(['event_id', 'rider_id']).doUpdateSet({ status, updated_on: new Date(now * 1000).toISOString() }))
+    : qb.deleteFrom('group_rsvps').where('event_id', '=', ride.id).where('rider_id', '=', riderId);
+  const [, data] = await run(db, [{ queries: [write], build: () => null }, groupRideParts(riderId, ride)] as const);
+  return data;
+}
+
 // ---------- friends ----------
 
 /** Riders sharing with Everyone whose username contains q, plus an exact username match for anyone. */
@@ -803,6 +897,8 @@ export function rpzApi(verify: Verify = verifyGoogleIdToken, fetcher: typeof fet
         case 'friendAdd': data = await apiFriendAdd(db, riderId, req.username); break;
         case 'friendRemove': data = await apiFriendRemove(db, riderId, req.username); break;
         case 'image': data = await apiImage(String(req.id)); break;
+        case 'groupRide': data = await apiGroupRide(db, riderId, String(req.key || 'sat')); break;
+        case 'groupRsvp': data = await apiGroupRsvp(db, riderId, String(req.key || 'sat'), String(req.eventId || ''), String(req.status || '')); break;
         case 'stravaConnect': {
           if (typeof req.code !== 'string' || !/^[A-Za-z0-9]{10,100}$/.test(req.code)) throw new UserError('Missing Strava code.');
           await requireRiderById(db, riderId);
