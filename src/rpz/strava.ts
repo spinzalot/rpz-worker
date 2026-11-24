@@ -87,7 +87,7 @@ export async function stravaPower(db: D1Database, env: StravaEnv, link: StravaLi
   for (let i = 0; i < time.length; i++) if (time[i] < secs) watts[time[i]] = w[i];
   for (let i = 1; i < secs; i++) if (watts[i] === null) watts[i] = watts[i - 1];
   return {
-    name: a.name, start: a.start_date, avgWatts: Math.round(a.average_watts || 0),
+    id: a.id, name: a.name, start: a.start_date, avgWatts: Math.round(a.average_watts || 0),
     cadence: Math.round(a.average_cadence || 0), hr: a.has_heartrate ? Math.round(a.average_heartrate || 0) : 0,
     ftp: link.ftp || 0, watts: watts.map((v) => v ?? 0),
   };
