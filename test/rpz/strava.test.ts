@@ -41,10 +41,11 @@ describe('strava', () => {
         { id: 2, name: 'Near', start_date: new Date((rodeAt + 30) * 1000).toISOString(), average_watts: 201.4, average_cadence: 85, has_heartrate: false },
       ]);
       expect(url).toContain('/activities/2/streams');
-      return json({ time: { data: [0, 1, 3] }, watts: { data: [100, 110, 130] } });
+      return json({ time: { data: [0, 1, 3] }, watts: { data: [100, 110, 130] }, heartrate: { data: [120, 122, 130] }, cadence: { data: [80, 0, 92] } });
     }) as unknown as typeof fetch;
     const p = await stravaPower(e.RPZ_DB, senv, await link(), rodeAt, 0, fake);
     expect(p).toMatchObject({ name: 'Near', avgWatts: 201, cadence: 85, hr: 0, ftp: 250, watts: [100, 110, 110, 130] });
+    expect(p).toMatchObject({ heartrate: [120, 122, 122, 130], cadences: [80, 0, 0, 92] });
     expect((await link())!.access).toBe('A2');
   });
 

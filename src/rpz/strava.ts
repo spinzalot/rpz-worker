@@ -78,17 +78,26 @@ export async function stravaPower(db: D1Database, env: StravaEnv, link: StravaLi
     .filter((x) => x.gap <= 1800).sort((x, y) => x.gap - y.gap)[0];
   if (!best) throw new UserError('No Strava activity found at the time of this ride. Is your Peloton connected to Strava?');
   const a = best.a;
-  const streams = await stravaGet<{ time?: { data: number[] }; watts?: { data: number[] } }>(db, env, link,
-    `/activities/${a.id}/streams?keys=time,watts&key_by_type=true`, fetcher);
+  // One request returns every trace we draw (Strava's limits count requests, not traces).
+  type Stream = { data: (number | null)[] };
+  const streams = await stravaGet<{ time?: Stream; watts?: Stream; heartrate?: Stream; cadence?: Stream }>(db, env, link,
+    `/activities/${a.id}/streams?keys=time,watts,heartrate,cadence&key_by_type=true`, fetcher);
   if (!streams.watts?.data?.length || !streams.time?.data?.length) throw new UserError('That Strava activity has no power data.');
-  const time = streams.time.data, w = streams.watts.data;
+  const time = streams.time.data as number[];
   const secs = Math.min(4 * 3600, Math.max(time[time.length - 1] + 1, (lengthMin || 0) * 60));   // bounded: 4 h max
-  const watts: (number | null)[] = new Array(secs).fill(null);
-  for (let i = 0; i < time.length; i++) if (time[i] < secs) watts[time[i]] = w[i];
-  for (let i = 1; i < secs; i++) if (watts[i] === null) watts[i] = watts[i - 1];
+  // One value per second of the ride, gaps filled with the last reading. A missing trace comes back empty.
+  const perSecond = (st?: Stream) => {
+    const d = st?.data; if (!d?.length) return [] as number[];
+    const out: (number | null)[] = new Array(secs).fill(null);
+    for (let i = 0; i < time.length && i < d.length; i++) if (time[i] < secs && d[i] != null) out[time[i]] = Math.round(d[i] as number);
+    for (let i = 1; i < secs; i++) if (out[i] === null) out[i] = out[i - 1];
+    return out.map((v) => v ?? 0);
+  };
+  const watts = perSecond(streams.watts), heartrate = perSecond(streams.heartrate), cadences = perSecond(streams.cadence);
   return {
     id: a.id, name: a.name, start: a.start_date, avgWatts: Math.round(a.average_watts || 0),
     cadence: Math.round(a.average_cadence || 0), hr: a.has_heartrate ? Math.round(a.average_heartrate || 0) : 0,
-    ftp: link.ftp || 0, watts: watts.map((v) => v ?? 0),
+    ftp: link.ftp || 0, watts, heartrate: heartrate.some((v) => v > 0) ? heartrate : [],
+    cadences: cadences.some((v) => v > 0) ? cadences : [],
   };
 }
